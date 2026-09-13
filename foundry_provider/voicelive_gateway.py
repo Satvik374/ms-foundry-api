@@ -27,12 +27,14 @@ class VoiceLiveSession:
         model: str | None = None,
         voice: str | None = None,
         instructions: str | None = None,
+        tools: list[Any] | None = None,
     ) -> None:
         self.client_ws = client_ws
         self.settings = settings
         self.model = model or settings.azure_voicelive_model
         self.voice = voice or settings.azure_voicelive_voice
         self.instructions = instructions or settings.azure_voicelive_instructions
+        self.tools = tools
         self._closed = False
         self._active_response = False
         self._conn: Any = None
@@ -48,6 +50,7 @@ class VoiceLiveSession:
             AudioEchoCancellation,
             AudioNoiseReduction,
             AzureStandardVoice,
+            FunctionTool,
             InputAudioFormat,
             Modality,
             OutputAudioFormat,
@@ -104,6 +107,21 @@ class VoiceLiveSession:
                     silence_duration_ms=500,
                 )
 
+                initial_tools: list[FunctionTool] | None = None
+                if getattr(self, "tools", None):
+                    initial_tools = []
+                    for t in self.tools:
+                        if isinstance(t, dict):
+                            initial_tools.append(
+                                FunctionTool(
+                                    name=t.get("name", ""),
+                                    description=t.get("description", ""),
+                                    parameters=t.get("parameters", {"type": "object"}),
+                                )
+                            )
+                        elif isinstance(t, FunctionTool):
+                            initial_tools.append(t)
+
                 session_config = RequestSession(
                     modalities=[Modality.TEXT, Modality.AUDIO],
                     instructions=self.instructions,
@@ -115,6 +133,7 @@ class VoiceLiveSession:
                     input_audio_noise_reduction=AudioNoiseReduction(
                         type="azure_deep_noise_suppression"
                     ),
+                    tools=initial_tools,
                 )
 
                 await connection.session.update(session=session_config)
@@ -233,19 +252,32 @@ class VoiceLiveSession:
                 elif msg_type == "conversation.item.create":
                     raw_item = data.get("item", {})
                     try:
-                        from azure.ai.voicelive.models import UserMessageItem, RequestTextContentPart
+                        from azure.ai.voicelive.models import (
+                            UserMessageItem,
+                            RequestTextContentPart,
+                            FunctionCallOutputItem,
+                        )
                         if isinstance(raw_item, dict):
-                            content_val = raw_item.get("content", [])
-                            parts = []
-                            if isinstance(content_val, str):
-                                parts.append(RequestTextContentPart(text=content_val))
-                            elif isinstance(content_val, list):
-                                for p in content_val:
-                                    if isinstance(p, dict) and p.get("type") in ("input_text", "text"):
-                                        parts.append(RequestTextContentPart(text=p.get("text", "")))
-                                    elif isinstance(p, str):
-                                        parts.append(RequestTextContentPart(text=p))
-                            item = UserMessageItem(content=parts) if parts else raw_item
+                            item_type = raw_item.get("type")
+                            if item_type == "function_call_output":
+                                item = FunctionCallOutputItem(
+                                    call_id=raw_item.get("call_id", ""),
+                                    output=str(raw_item.get("output", "")),
+                                )
+                            elif item_type in {"message", "user", None}:
+                                content_val = raw_item.get("content", [])
+                                parts = []
+                                if isinstance(content_val, str):
+                                    parts.append(RequestTextContentPart(text=content_val))
+                                elif isinstance(content_val, list):
+                                    for p in content_val:
+                                        if isinstance(p, dict) and p.get("type") in ("input_text", "text"):
+                                            parts.append(RequestTextContentPart(text=p.get("text", "")))
+                                        elif isinstance(p, str):
+                                            parts.append(RequestTextContentPart(text=p))
+                                item = UserMessageItem(content=parts) if parts else raw_item
+                            else:
+                                item = raw_item
                         else:
                             item = raw_item
                         await connection.conversation.item.create(item=item)
@@ -253,6 +285,24 @@ class VoiceLiveSession:
                         logger.warning("Failed to create conversation item: %s", e)
                 elif msg_type == "session.update":
                     session = data.get("session", {})
+                    if isinstance(session, dict) and "tools" in session:
+                        from azure.ai.voicelive.models import FunctionTool
+                        tools_raw = session.get("tools", [])
+                        converted_tools = []
+                        for t in tools_raw:
+                            if isinstance(t, dict):
+                                converted_tools.append(
+                                    FunctionTool(
+                                        name=t.get("name", ""),
+                                        description=t.get("description", ""),
+                                        parameters=t.get("parameters", {"type": "object"}),
+                                    )
+                                )
+                            else:
+                                converted_tools.append(t)
+                        session_copy = dict(session)
+                        session_copy["tools"] = converted_tools
+                        session = session_copy
                     await connection.session.update(session=session)
         except (WebSocketDisconnect, asyncio.CancelledError):
             pass
@@ -272,6 +322,7 @@ class VoiceLiveGateway:
         model: str | None = None,
         voice: str | None = None,
         instructions: str | None = None,
+        tools: list[Any] | None = None,
     ) -> VoiceLiveSession:
         return VoiceLiveSession(
             client_ws=client_ws,
@@ -279,4 +330,5 @@ class VoiceLiveGateway:
             model=model,
             voice=voice,
             instructions=instructions,
+            tools=tools,
         )
