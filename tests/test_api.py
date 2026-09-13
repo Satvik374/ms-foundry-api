@@ -532,4 +532,75 @@ def test_realtime_ws_audio_exchange() -> None:
         assert updated["session"]["voice"] == "en-US-Ava:DragonHDLatestNeural"
 
 
+def test_anthropic_messages_non_streaming() -> None:
+    client, fake_gateway = make_client()
+    res = client.post(
+        "/v1/messages",
+        headers={"x-api-key": "frly_provider_test"},
+        json={
+            "model": "gpt-6",
+            "messages": [{"role": "user", "content": "Hello from Claude Code"}],
+            "stream": False,
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["type"] == "message"
+    assert data["role"] == "assistant"
+    assert data["content"][0]["text"] == "Hello there"
+    assert data["model"] == "gpt-6"
+    assert data["stop_reason"] == "end_turn"
 
+
+def test_anthropic_messages_streaming() -> None:
+    client, fake_gateway = make_client()
+    res = client.post(
+        "/v1/messages",
+        headers={"x-api-key": "frly_provider_test"},
+        json={
+            "model": "gpt-6",
+            "system": "You are a code assistant.",
+            "messages": [{"role": "user", "content": "Count to two"}],
+            "stream": True,
+        },
+    )
+    assert res.status_code == 200
+    assert "text/event-stream" in res.headers["content-type"]
+    text = res.text
+    assert "event: message_start" in text
+    assert "event: content_block_start" in text
+    assert "event: content_block_delta" in text
+    assert "event: content_block_stop" in text
+    assert "event: message_delta" in text
+    assert "event: message_stop" in text
+
+
+def test_anthropic_messages_route_aliases() -> None:
+    client, fake_gateway = make_client()
+    for route in ("/messages", "/v1/v1/messages"):
+        res = client.post(
+            route,
+            headers={"anthropic-auth-token": "frly_provider_test"},
+            json={
+                "model": "claude-3-7-sonnet-20250219",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": False,
+            },
+        )
+        assert res.status_code == 200
+        assert res.json()["role"] == "assistant"
+
+
+def test_models_endpoint_has_claude_and_can_get_single_model() -> None:
+    client, _ = make_client()
+    res = client.get("/v1/models", headers={"Authorization": "Bearer frly_provider_test"})
+    assert res.status_code == 200
+    ids = [m["id"] for m in res.json()["data"]]
+    assert "gpt-6" in ids
+    assert "claude-3-7-sonnet-20250219" in ids
+    assert "claude-3-5-sonnet-20241022" in ids
+
+    # Check single model query
+    res_single = client.get("/v1/models/gpt-6", headers={"x-api-key": "frly_provider_test"})
+    assert res_single.status_code == 200
+    assert res_single.json()["id"] == "gpt-6"

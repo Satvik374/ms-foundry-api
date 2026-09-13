@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -98,14 +99,92 @@ def _chat_response_payload(body: ChatCompletionsRequest) -> dict[str, Any]:
         "model": body.model,
         "input": _chat_input_messages(body),
     }
-    # Agent-reference calls use the agent version's configured model settings and
-    # reject per-request sampling controls such as temperature/top_p. Accept these
-    # OpenAI-compatible fields at our boundary but do not forward them to Foundry.
     max_tokens = body.max_completion_tokens or body.max_tokens
     if max_tokens is not None:
         payload["max_output_tokens"] = max_tokens
     if body.metadata is not None:
         payload["metadata"] = body.metadata
+    return payload
+
+
+def _anthropic_to_foundry_payload(
+    body: dict[str, Any],
+    default_model: str,
+) -> dict[str, Any]:
+    instructions: list[str] = []
+    system_val = body.get("system")
+    if isinstance(system_val, str) and system_val.strip():
+        instructions.append(system_val.strip())
+    elif isinstance(system_val, list):
+        for item in system_val:
+            if isinstance(item, str) and item.strip():
+                instructions.append(item.strip())
+            elif isinstance(item, dict) and item.get("type") == "text":
+                txt = item.get("text", "").strip()
+                if txt:
+                    instructions.append(txt)
+
+    raw_messages = body.get("messages", [])
+    messages: list[dict[str, Any]] = []
+
+    for msg in raw_messages:
+        role = msg.get("role", "user")
+        if role not in {"user", "assistant"}:
+            role = "user"
+        content = msg.get("content", "")
+        text_parts: list[str] = []
+        if isinstance(content, str):
+            text_parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, str):
+                    text_parts.append(block)
+                elif isinstance(block, dict):
+                    block_type = block.get("type")
+                    if block_type == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block_type == "tool_result":
+                        tool_id = block.get("tool_use_id", "")
+                        c = block.get("content", "")
+                        if isinstance(c, list):
+                            c = " ".join(
+                                b.get("text", "") for b in c if isinstance(b, dict)
+                            )
+                        text_parts.append(f"[Tool Result {tool_id}]: {c}")
+                    elif block_type == "tool_use":
+                        name = block.get("name", "")
+                        inp = json.dumps(block.get("input", {}), separators=(",", ":"))
+                        text_parts.append(f"[Tool Use: {name}({inp})]")
+        full_text = "\n".join(text_parts) if text_parts else "Hello"
+        messages.append({"role": role, "content": full_text})
+
+    if not messages:
+        messages = [{"role": "user", "content": "Hello"}]
+
+    if instructions:
+        prefix = (
+            "Client system instructions (follow these before the user request):\n"
+            + "\n\n".join(instructions)
+            + "\n\nUser request:\n"
+        )
+        for message in messages:
+            if message.get("role") == "user":
+                message["content"] = prefix + str(message.get("content", ""))
+                break
+        else:
+            messages.insert(0, {"role": "user", "content": prefix.rstrip()})
+
+    for message in messages:
+        if not message.get("content"):
+            message["content"] = "Hello"
+
+    payload: dict[str, Any] = {
+        "model": default_model,
+        "input": messages,
+    }
+    max_tokens = body.get("max_tokens")
+    if max_tokens is not None:
+        payload["max_output_tokens"] = max_tokens
     return payload
 
 
@@ -270,37 +349,76 @@ def create_app(
             headers={"Cache-Control": "no-store, max-age=0"},
         )
 
-    @app.get("/v1/models", dependencies=[Depends(require_provider_key)])
-    async def models() -> dict[str, Any]:
+    known_models = [
+        {"id": runtime_settings.provider_model_id, "display_name": f"{runtime_settings.provider_model_id} (Foundry)"},
+        {"id": "gpt-6", "display_name": "GPT-6 (Foundry)"},
+        {"id": "claude-3-7-sonnet-20250219", "display_name": "Claude 3.7 Sonnet"},
+        {"id": "claude-3-5-sonnet-20241022", "display_name": "Claude 3.5 Sonnet"},
+        {"id": "claude-3-5-haiku-20241022", "display_name": "Claude 3.5 Haiku"},
+        {"id": "claude-3-opus-20240229", "display_name": "Claude 3 Opus"},
+        {"id": "claude-3-5-sonnet", "display_name": "Claude 3.5 Sonnet"},
+        {"id": "claude-3-7-sonnet", "display_name": "Claude 3.7 Sonnet"},
+        {"id": "claude-3-haiku", "display_name": "Claude 3 Haiku"},
+        {"id": "claude-3-opus", "display_name": "Claude 3 Opus"},
+        {"id": "gpt-4o", "display_name": "GPT-4o"},
+        {"id": "gpt-4o-mini", "display_name": "GPT-4o mini"},
+        {"id": "gpt-4", "display_name": "GPT-4"},
+        {"id": "tts-1", "display_name": "TTS-1", "owned_by": "azure-cognitive-services"},
+        {"id": "tts-1-hd", "display_name": "TTS-1 HD", "owned_by": "azure-cognitive-services"},
+        {"id": "gpt-realtime", "display_name": "GPT Realtime", "owned_by": "azure-voicelive"},
+    ]
+
+    def _build_models_list() -> dict[str, Any]:
+        seen: set[str] = set()
+        data = []
+        for m in known_models:
+            mid = m["id"]
+            if mid in seen:
+                continue
+            seen.add(mid)
+            data.append(
+                {
+                    "id": mid,
+                    "object": "model",
+                    "type": "model",
+                    "display_name": m["display_name"],
+                    "created": 0,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "owned_by": m.get("owned_by", "microsoft-foundry"),
+                }
+            )
         return {
             "object": "list",
-            "data": [
-                {
-                    "id": runtime_settings.provider_model_id,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "microsoft-foundry",
-                },
-                {
-                    "id": "tts-1",
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "azure-cognitive-services",
-                },
-                {
-                    "id": "tts-1-hd",
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "azure-cognitive-services",
-                },
-                {
-                    "id": "gpt-realtime",
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "azure-voicelive",
-                },
-            ],
+            "data": data,
+            "has_more": False,
+            "first_id": data[0]["id"] if data else "",
+            "last_id": data[-1]["id"] if data else "",
         }
+
+    @app.get("/v1/models", dependencies=[Depends(require_provider_key)])
+    @app.get("/models", dependencies=[Depends(require_provider_key)])
+    @app.get("/v1/v1/models", dependencies=[Depends(require_provider_key)])
+    async def models() -> dict[str, Any]:
+        return _build_models_list()
+
+    @app.get("/v1/models/{model_id:path}", dependencies=[Depends(require_provider_key)])
+    @app.get("/models/{model_id:path}", dependencies=[Depends(require_provider_key)])
+    @app.get("/v1/v1/models/{model_id:path}", dependencies=[Depends(require_provider_key)])
+    async def get_model(model_id: str) -> dict[str, Any]:
+        return {
+            "id": model_id,
+            "object": "model",
+            "type": "model",
+            "display_name": model_id,
+            "created": 0,
+            "created_at": "2024-01-01T00:00:00Z",
+            "owned_by": "microsoft-foundry",
+        }
+
+    @app.api_route("/v1/api/hello", methods=["GET", "HEAD"], include_in_schema=False)
+    @app.api_route("/api/hello", methods=["GET", "HEAD"], include_in_schema=False)
+    async def api_hello() -> dict[str, str]:
+        return {"status": "ok"}
 
     @app.post("/v1/audio/speech", dependencies=[Depends(require_provider_key)])
     async def audio_speech(body: SpeechRequest):
@@ -482,6 +600,113 @@ def create_app(
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+
+    @app.post("/v1/messages", dependencies=[Depends(require_provider_key)])
+    @app.post("/messages", dependencies=[Depends(require_provider_key)])
+    @app.post("/v1/v1/messages", dependencies=[Depends(require_provider_key)])
+    async def anthropic_messages(request: Request):
+        body = await request.json()
+        model_name = body.get("model") or runtime_settings.provider_model_id
+        stream = bool(body.get("stream", False))
+        response_payload = _anthropic_to_foundry_payload(
+            body, runtime_settings.provider_model_id
+        )
+
+        if stream:
+            events = await run_in_threadpool(
+                runtime_gateway.stream_events, response_payload
+            )
+
+            def anthropic_event_stream():
+                msg_id = f"msg_{secrets.token_hex(12)}"
+                start_event = {
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": model_name,
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 10, "output_tokens": 0},
+                    },
+                }
+                yield f"event: message_start\ndata: {json.dumps(start_event, separators=(',', ':'))}\n\n"
+
+                block_start = {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }
+                yield f"event: content_block_start\ndata: {json.dumps(block_start, separators=(',', ':'))}\n\n"
+
+                output_tokens = 0
+                try:
+                    for event in events:
+                        if event.get("type") != "response.output_text.delta":
+                            continue
+                        delta_text = event.get("delta", "")
+                        if not delta_text:
+                            continue
+                        output_tokens += 1
+                        delta_event = {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": delta_text},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(delta_event, separators=(',', ':'))}\n\n"
+                except Exception as exc:
+                    err_event = {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": str(exc)},
+                    }
+                    yield f"event: error\ndata: {json.dumps(err_event, separators=(',', ':'))}\n\n"
+
+                block_stop = {"type": "content_block_stop", "index": 0}
+                yield f"event: content_block_stop\ndata: {json.dumps(block_stop, separators=(',', ':'))}\n\n"
+
+                msg_delta = {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": max(output_tokens, 1)},
+                }
+                yield f"event: message_delta\ndata: {json.dumps(msg_delta, separators=(',', ':'))}\n\n"
+
+                yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'}, separators=(',', ':'))}\n\n"
+
+            return StreamingResponse(
+                anthropic_event_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "anthropic-version": "2023-06-01",
+                },
+            )
+
+        foundry_response = await run_in_threadpool(
+            runtime_gateway.create_response, response_payload
+        )
+        usage = foundry_response.get("usage") or {}
+        text_content = extract_output_text(foundry_response)
+        msg_id = f"msg_{secrets.token_hex(12)}"
+        return JSONResponse(
+            content={
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": text_content}],
+                "model": model_name,
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": usage.get("input_tokens", 10),
+                    "output_tokens": usage.get("output_tokens", 10),
+                },
+            },
+            headers={"anthropic-version": "2023-06-01"},
+        )
 
     app.mount("/assets", NoCacheStaticFiles(directory=STATIC_DIR), name="assets")
 
