@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Leftovers from the discarded JavaScript starter
+node_modules/
+
+# Local secrets and editor state
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+*.pem
+
+# Operating system and local output
+.DS_Store
+Thumbs.db
+logs/
+dist/
+build/
+outputs/
+work/
