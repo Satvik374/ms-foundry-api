@@ -16,6 +16,28 @@ class FakeResponses:
     def create(self, **kwargs: Any):
         self.calls.append(kwargs)
         if kwargs.get("stream"):
+            if kwargs.get("tools"):
+                tool_name = kwargs["tools"][0].get("name", "Write")
+                return iter(
+                    [
+                        {"type": "response.created", "response": {"id": "resp_test"}},
+                        {
+                            "type": "response.output_item.added",
+                            "item": {
+                                "type": "function_call",
+                                "call_id": "call_123",
+                                "name": tool_name,
+                            },
+                        },
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "delta": '{"file_path":"game.html"}',
+                        },
+                        {"type": "response.function_call_arguments.done"},
+                        {"type": "response.output_item.done"},
+                        {"type": "response.completed", "response": {"id": "resp_test"}},
+                    ]
+                )
             return iter(
                 [
                     {"type": "response.created", "response": {"id": "resp_test"}},
@@ -24,6 +46,22 @@ class FakeResponses:
                     {"type": "response.completed", "response": {"id": "resp_test"}},
                 ]
             )
+        if kwargs.get("tools"):
+            tool_name = kwargs["tools"][0].get("name", "Write")
+            return {
+                "id": "resp_test",
+                "object": "response",
+                "model": "azure-internal-model",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_123",
+                        "name": tool_name,
+                        "arguments": json.dumps({"file_path": "game.html", "content": "<h1>Minecraft</h1>"}),
+                    }
+                ],
+                "usage": {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+            }
         return {
             "id": "resp_test",
             "object": "response",
@@ -604,3 +642,120 @@ def test_models_endpoint_has_claude_and_can_get_single_model() -> None:
     res_single = client.get("/v1/models/gpt-6", headers={"x-api-key": "frly_provider_test"})
     assert res_single.status_code == 200
     assert res_single.json()["id"] == "gpt-6"
+
+
+def test_anthropic_messages_tool_use_non_streaming() -> None:
+    client, fake = make_client()
+    res = client.post(
+        "/v1/messages",
+        headers={"x-api-key": "frly_provider_test"},
+        json={
+            "model": "claude-3-7-sonnet-20250219",
+            "messages": [{"role": "user", "content": "Create game.html"}],
+            "tools": [
+                {
+                    "name": "Write",
+                    "description": "Write a file",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["file_path", "content"],
+                    },
+                }
+            ],
+            "stream": False,
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["stop_reason"] == "tool_use"
+    assert len(data["content"]) == 1
+    assert data["content"][0]["type"] == "tool_use"
+    assert data["content"][0]["name"] == "Write"
+    assert data["content"][0]["input"] == {
+        "file_path": "game.html",
+        "content": "<h1>Minecraft</h1>",
+    }
+
+
+def test_anthropic_messages_tool_use_streaming() -> None:
+    client, fake = make_client()
+    res = client.post(
+        "/v1/messages",
+        headers={"x-api-key": "frly_provider_test"},
+        json={
+            "model": "claude-3-7-sonnet-20250219",
+            "messages": [{"role": "user", "content": "Create game.html"}],
+            "tools": [
+                {
+                    "name": "Write",
+                    "description": "Write a file",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                    },
+                }
+            ],
+            "stream": True,
+        },
+    )
+    assert res.status_code == 200
+    text = res.text
+    assert "event: content_block_start" in text
+    assert '"type":"tool_use"' in text
+    assert '"name":"Write"' in text
+    assert "event: content_block_delta" in text
+    assert '"type":"input_json_delta"' in text
+    assert "event: content_block_stop" in text
+    assert '"stop_reason":"tool_use"' in text
+    assert "event: message_stop" in text
+
+
+def test_anthropic_messages_tool_result_in_history() -> None:
+    client, fake = make_client()
+    res = client.post(
+        "/v1/messages",
+        headers={"x-api-key": "frly_provider_test"},
+        json={
+            "model": "claude-3-7-sonnet-20250219",
+            "messages": [
+                {"role": "user", "content": "Create game.html"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_123",
+                            "name": "Write",
+                            "input": {"file_path": "game.html", "content": "test"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_123",
+                            "content": "File created successfully",
+                        }
+                    ],
+                },
+            ],
+            "stream": False,
+        },
+    )
+    assert res.status_code == 200
+    call = fake.responses.calls[-1]
+    # Check that input contains function_call and function_call_output
+    input_items = call["input"]
+    call_items = [item for item in input_items if item.get("type") == "function_call"]
+    output_items = [item for item in input_items if item.get("type") == "function_call_output"]
+    assert len(call_items) == 1
+    assert call_items[0]["name"] == "Write"
+    assert len(output_items) == 1
+    assert output_items[0]["output"] == "File created successfully"
+

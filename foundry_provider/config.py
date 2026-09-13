@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     )
     foundry_agent_name: str = "gpt-6"
     foundry_agent_version: str = "1"
+    foundry_model_deployment: str = "gpt-6-astra"
 
     provider_model_id: str = "gpt-6"
     provider_api_key: str = ""
@@ -118,9 +119,15 @@ class Settings(BaseSettings):
             self.foundry_agent_name,
             f"{self.foundry_agent_name}:{self.foundry_agent_version}",
             f"{self.foundry_agent_name}@{self.foundry_agent_version}",
+            self.foundry_model_deployment,
             "jarvis-2",
             "jarvis",
             "gpt-realtime",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-5-sonnet-latest",
+            "claude-3-5-haiku-20241022",
+            "claude-3-opus-20240229",
         }
 
 

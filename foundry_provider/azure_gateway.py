@@ -131,7 +131,10 @@ class FoundryGateway:
     ) -> dict[str, Any]:
         prepared = dict(payload)
         requested_model = prepared.pop("model", None)
-        if requested_model and requested_model not in self.settings.accepted_model_ids():
+        accepted = self.settings.accepted_model_ids()
+        if requested_model and requested_model not in accepted and not (
+            requested_model.startswith("claude-") or requested_model.startswith("gpt-")
+        ):
             raise ProviderError(
                 f"Model '{requested_model}' is not available.",
                 status_code=404,
@@ -139,14 +142,26 @@ class FoundryGateway:
                 param="model",
             )
 
-        supplied_extra = prepared.pop("extra_body", None)
-        extra_body = dict(supplied_extra) if isinstance(supplied_extra, dict) else {}
-        extra_body["agent_reference"] = {
-            "name": self.settings.foundry_agent_name,
-            "version": self.settings.foundry_agent_version,
-            "type": "agent_reference",
-        }
-        prepared["extra_body"] = extra_body
+        use_direct = prepared.pop("use_direct_deployment", False)
+        if "tools" in prepared or "instructions" in prepared or use_direct:
+            deployment = (
+                getattr(self.settings, "foundry_model_deployment", None)
+                or self.settings.foundry_agent_name
+            )
+            prepared["model"] = deployment
+            supplied_extra = prepared.pop("extra_body", None)
+            if supplied_extra:
+                prepared["extra_body"] = supplied_extra
+        else:
+            supplied_extra = prepared.pop("extra_body", None)
+            extra_body = dict(supplied_extra) if isinstance(supplied_extra, dict) else {}
+            extra_body["agent_reference"] = {
+                "name": self.settings.foundry_agent_name,
+                "version": self.settings.foundry_agent_version,
+                "type": "agent_reference",
+            }
+            prepared["extra_body"] = extra_body
+
         prepared["stream"] = stream
         prepared["timeout"] = self.settings.request_timeout_seconds
         if "input" in prepared:

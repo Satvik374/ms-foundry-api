@@ -231,8 +231,26 @@ class VoiceLiveSession:
                 elif msg_type == "response.cancel":
                     await connection.response.cancel()
                 elif msg_type == "conversation.item.create":
-                    item = data.get("item", {})
-                    await connection.conversation_item.create(item=item)
+                    raw_item = data.get("item", {})
+                    try:
+                        from azure.ai.voicelive.models import UserMessageItem, RequestTextContentPart
+                        if isinstance(raw_item, dict):
+                            content_val = raw_item.get("content", [])
+                            parts = []
+                            if isinstance(content_val, str):
+                                parts.append(RequestTextContentPart(text=content_val))
+                            elif isinstance(content_val, list):
+                                for p in content_val:
+                                    if isinstance(p, dict) and p.get("type") in ("input_text", "text"):
+                                        parts.append(RequestTextContentPart(text=p.get("text", "")))
+                                    elif isinstance(p, str):
+                                        parts.append(RequestTextContentPart(text=p))
+                            item = UserMessageItem(content=parts) if parts else raw_item
+                        else:
+                            item = raw_item
+                        await connection.conversation.item.create(item=item)
+                    except Exception as e:
+                        logger.warning("Failed to create conversation item: %s", e)
                 elif msg_type == "session.update":
                     session = data.get("session", {})
                     await connection.session.update(session=session)

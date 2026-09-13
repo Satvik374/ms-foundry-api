@@ -125,63 +125,93 @@ def _anthropic_to_foundry_payload(
                     instructions.append(txt)
 
     raw_messages = body.get("messages", [])
-    messages: list[dict[str, Any]] = []
+    input_items: list[dict[str, Any]] = []
 
     for msg in raw_messages:
         role = msg.get("role", "user")
         if role not in {"user", "assistant"}:
             role = "user"
         content = msg.get("content", "")
-        text_parts: list[str] = []
+
         if isinstance(content, str):
-            text_parts.append(content)
+            if content.strip():
+                input_items.append({"role": role, "content": content})
         elif isinstance(content, list):
+            text_parts: list[str] = []
             for block in content:
                 if isinstance(block, str):
                     text_parts.append(block)
                 elif isinstance(block, dict):
-                    block_type = block.get("type")
-                    if block_type == "text":
+                    b_type = block.get("type")
+                    if b_type == "text":
                         text_parts.append(block.get("text", ""))
-                    elif block_type == "tool_result":
-                        tool_id = block.get("tool_use_id", "")
+                    elif b_type == "tool_use":
+                        if text_parts:
+                            input_items.append({"role": role, "content": "\n".join(text_parts)})
+                            text_parts = []
+                        inp = block.get("input", {})
+                        inp_str = inp if isinstance(inp, str) else json.dumps(inp, separators=(",", ":"))
+                        call_id = block.get("id") or f"call_{secrets.token_hex(8)}"
+                        input_items.append({
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": block.get("name", "tool"),
+                            "arguments": inp_str,
+                        })
+                    elif b_type == "tool_result":
+                        if text_parts:
+                            input_items.append({"role": role, "content": "\n".join(text_parts)})
+                            text_parts = []
                         c = block.get("content", "")
                         if isinstance(c, list):
-                            c = " ".join(
-                                b.get("text", "") for b in c if isinstance(b, dict)
+                            c = "\n".join(
+                                sub.get("text", "") for sub in c if isinstance(sub, dict) and sub.get("text")
                             )
-                        text_parts.append(f"[Tool Result {tool_id}]: {c}")
-                    elif block_type == "tool_use":
-                        name = block.get("name", "")
-                        inp = json.dumps(block.get("input", {}), separators=(",", ":"))
-                        text_parts.append(f"[Tool Use: {name}({inp})]")
-        full_text = "\n".join(text_parts) if text_parts else "Hello"
-        messages.append({"role": role, "content": full_text})
+                        call_id = block.get("tool_use_id", "")
+                        input_items.append({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": str(c),
+                        })
+                    elif b_type in {"image", "input_image"}:
+                        text_parts.append("[Image attachment]")
+            if text_parts:
+                input_items.append({"role": role, "content": "\n".join(text_parts)})
 
-    if not messages:
-        messages = [{"role": "user", "content": "Hello"}]
+    if not input_items:
+        input_items = [{"role": "user", "content": "Hello"}]
 
+    system_persona = (
+        "You are Claude Code, an agentic AI coding assistant executing directly in the user's terminal on their local computer.\n"
+        "You have full permission, authority, and capability to create, edit, view local files and run terminal commands through your tools.\n"
+        "CRITICAL: Never say that you cannot access local files or cannot create files in this chat.\n"
+        "When the user asks to build, create, or modify code, files, or projects, immediately invoke the appropriate tools (such as Write, Edit, Bash) to perform the changes directly on the filesystem."
+    )
+    all_instructions = [system_persona]
     if instructions:
-        prefix = (
-            "Client system instructions (follow these before the user request):\n"
-            + "\n\n".join(instructions)
-            + "\n\nUser request:\n"
-        )
-        for message in messages:
-            if message.get("role") == "user":
-                message["content"] = prefix + str(message.get("content", ""))
-                break
-        else:
-            messages.insert(0, {"role": "user", "content": prefix.rstrip()})
-
-    for message in messages:
-        if not message.get("content"):
-            message["content"] = "Hello"
+        all_instructions.extend(instructions)
 
     payload: dict[str, Any] = {
         "model": default_model,
-        "input": messages,
+        "instructions": "\n\n".join(all_instructions),
+        "input": input_items,
     }
+
+    raw_tools = body.get("tools", [])
+    foundry_tools: list[dict[str, Any]] = []
+    if isinstance(raw_tools, list):
+        for tool in raw_tools:
+            if isinstance(tool, dict) and "name" in tool:
+                schema = tool.get("input_schema") or {"type": "object", "properties": {}}
+                foundry_tools.append({
+                    "type": "function",
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": schema,
+                })
+    if foundry_tools:
+        payload["tools"] = foundry_tools
+
     max_tokens = body.get("max_tokens")
     if max_tokens is not None:
         payload["max_output_tokens"] = max_tokens
@@ -634,46 +664,131 @@ def create_app(
                 }
                 yield f"event: message_start\ndata: {json.dumps(start_event, separators=(',', ':'))}\n\n"
 
-                block_start = {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                }
-                yield f"event: content_block_start\ndata: {json.dumps(block_start, separators=(',', ':'))}\n\n"
-
+                current_block_index = -1
+                active_block_type: str | None = None  # "text" or "tool_use"
+                has_tool_call = False
                 output_tokens = 0
+
                 try:
                     for event in events:
-                        if event.get("type") != "response.output_text.delta":
-                            continue
-                        delta_text = event.get("delta", "")
-                        if not delta_text:
-                            continue
-                        output_tokens += 1
-                        delta_event = {
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {"type": "text_delta", "text": delta_text},
-                        }
-                        yield f"event: content_block_delta\ndata: {json.dumps(delta_event, separators=(',', ':'))}\n\n"
+                        ev_type = event.get("type", "")
+
+                        if ev_type == "response.output_item.added":
+                            item = event.get("item", {})
+                            item_type = item.get("type") if isinstance(item, dict) else None
+                            if item_type == "function_call":
+                                if active_block_type is not None:
+                                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index}, separators=(',', ':'))}\n\n"
+                                    active_block_type = None
+                                current_block_index += 1
+                                active_block_type = "tool_use"
+                                has_tool_call = True
+                                call_id = item.get("call_id") or item.get("id") or f"toolu_{secrets.token_hex(8)}"
+                                name = item.get("name", "tool")
+                                start_data = {
+                                    "type": "content_block_start",
+                                    "index": current_block_index,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": call_id,
+                                        "name": name,
+                                        "input": {},
+                                    },
+                                }
+                                yield f"event: content_block_start\ndata: {json.dumps(start_data, separators=(',', ':'))}\n\n"
+
+                        elif ev_type == "response.function_call_arguments.delta":
+                            delta_json = event.get("delta", "")
+                            if not delta_json:
+                                continue
+                            output_tokens += 1
+                            if active_block_type != "tool_use":
+                                if active_block_type is not None:
+                                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index}, separators=(',', ':'))}\n\n"
+                                    active_block_type = None
+                                current_block_index += 1
+                                active_block_type = "tool_use"
+                                has_tool_call = True
+                                call_id = event.get("call_id") or f"toolu_{secrets.token_hex(8)}"
+                                name = event.get("name", "tool")
+                                start_data = {
+                                    "type": "content_block_start",
+                                    "index": current_block_index,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": call_id,
+                                        "name": name,
+                                        "input": {},
+                                    },
+                                }
+                                yield f"event: content_block_start\ndata: {json.dumps(start_data, separators=(',', ':'))}\n\n"
+                            delta_data = {
+                                "type": "content_block_delta",
+                                "index": current_block_index,
+                                "delta": {"type": "input_json_delta", "partial_json": delta_json},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(delta_data, separators=(',', ':'))}\n\n"
+
+                        elif ev_type in {"response.function_call_arguments.done", "response.output_item.done"}:
+                            item = event.get("item", {})
+                            item_type = item.get("type") if isinstance(item, dict) else None
+                            if active_block_type == "tool_use" and (item_type == "function_call" or ev_type == "response.function_call_arguments.done"):
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index}, separators=(',', ':'))}\n\n"
+                                active_block_type = None
+                            elif active_block_type == "text" and item_type == "message":
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index}, separators=(',', ':'))}\n\n"
+                                active_block_type = None
+
+                        elif ev_type == "response.output_text.delta":
+                            delta_text = event.get("delta", "")
+                            if not delta_text:
+                                continue
+                            output_tokens += 1
+                            if active_block_type != "text":
+                                if active_block_type is not None:
+                                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index}, separators=(',', ':'))}\n\n"
+                                    active_block_type = None
+                                current_block_index += 1
+                                active_block_type = "text"
+                                start_data = {
+                                    "type": "content_block_start",
+                                    "index": current_block_index,
+                                    "content_block": {"type": "text", "text": ""},
+                                }
+                                yield f"event: content_block_start\ndata: {json.dumps(start_data, separators=(',', ':'))}\n\n"
+                            delta_data = {
+                                "type": "content_block_delta",
+                                "index": current_block_index,
+                                "delta": {"type": "text_delta", "text": delta_text},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(delta_data, separators=(',', ':'))}\n\n"
+
+                    if active_block_type is not None:
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index}, separators=(',', ':'))}\n\n"
+                        active_block_type = None
+
+                    if current_block_index < 0:
+                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}}, separators=(',', ':'))}\n\n"
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0}, separators=(',', ':'))}\n\n"
+
+                    stop_reason = "tool_use" if has_tool_call else "end_turn"
+                    msg_delta = {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                        "usage": {"output_tokens": max(output_tokens, 1)},
+                    }
+                    yield f"event: message_delta\ndata: {json.dumps(msg_delta, separators=(',', ':'))}\n\n"
+                    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'}, separators=(',', ':'))}\n\n"
+
                 except Exception as exc:
+                    if active_block_type is not None:
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index}, separators=(',', ':'))}\n\n"
                     err_event = {
                         "type": "error",
                         "error": {"type": "api_error", "message": str(exc)},
                     }
                     yield f"event: error\ndata: {json.dumps(err_event, separators=(',', ':'))}\n\n"
-
-                block_stop = {"type": "content_block_stop", "index": 0}
-                yield f"event: content_block_stop\ndata: {json.dumps(block_stop, separators=(',', ':'))}\n\n"
-
-                msg_delta = {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                    "usage": {"output_tokens": max(output_tokens, 1)},
-                }
-                yield f"event: message_delta\ndata: {json.dumps(msg_delta, separators=(',', ':'))}\n\n"
-
-                yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'}, separators=(',', ':'))}\n\n"
+                    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'}, separators=(',', ':'))}\n\n"
 
             return StreamingResponse(
                 anthropic_event_stream(),
@@ -689,16 +804,52 @@ def create_app(
             runtime_gateway.create_response, response_payload
         )
         usage = foundry_response.get("usage") or {}
-        text_content = extract_output_text(foundry_response)
+        content_blocks: list[dict[str, Any]] = []
+        has_tool_call = False
+
+        for item in foundry_response.get("output", []):
+            item_type = item.get("type")
+            if item_type == "message":
+                for c in item.get("content", []):
+                    if c.get("type") in {"text", "output_text"}:
+                        text_val = c.get("text", "")
+                        if text_val:
+                            content_blocks.append({"type": "text", "text": text_val})
+            elif item_type == "function_call":
+                call_id = item.get("call_id") or item.get("id") or f"toolu_{secrets.token_hex(8)}"
+                name = item.get("name", "tool")
+                raw_args = item.get("arguments", "{}")
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                    except Exception:
+                        args = {"raw": raw_args}
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    args = {}
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": args,
+                })
+                has_tool_call = True
+
+        if not content_blocks:
+            text_content = extract_output_text(foundry_response)
+            content_blocks = [{"type": "text", "text": text_content}]
+
+        stop_reason = "tool_use" if has_tool_call else "end_turn"
         msg_id = f"msg_{secrets.token_hex(12)}"
         return JSONResponse(
             content={
                 "id": msg_id,
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "text", "text": text_content}],
+                "content": content_blocks,
                 "model": model_name,
-                "stop_reason": "end_turn",
+                "stop_reason": stop_reason,
                 "stop_sequence": None,
                 "usage": {
                     "input_tokens": usage.get("input_tokens", 10),
