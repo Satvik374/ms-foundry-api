@@ -256,13 +256,24 @@ class VoiceLiveSession:
                             UserMessageItem,
                             RequestTextContentPart,
                             FunctionCallOutputItem,
+                            FunctionCallItem,
                         )
                         if isinstance(raw_item, dict):
                             item_type = raw_item.get("type")
-                            if item_type == "function_call_output":
+                            if item_type == "function_call_output" or ("call_id" in raw_item and "output" in raw_item) or ("call_id" in data and "output" in data):
+                                call_id = raw_item.get("call_id") or data.get("call_id", "")
+                                out = raw_item.get("output") if "output" in raw_item else data.get("output", "")
+                                if isinstance(out, (dict, list)):
+                                    out = json.dumps(out)
                                 item = FunctionCallOutputItem(
+                                    call_id=str(call_id),
+                                    output=str(out),
+                                )
+                            elif item_type == "function_call":
+                                item = FunctionCallItem(
                                     call_id=raw_item.get("call_id", ""),
-                                    output=str(raw_item.get("output", "")),
+                                    name=raw_item.get("name", ""),
+                                    arguments=raw_item.get("arguments", "{}"),
                                 )
                             elif item_type in {"message", "user", None}:
                                 content_val = raw_item.get("content", [])
