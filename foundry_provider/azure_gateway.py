@@ -223,11 +223,20 @@ class FoundryGateway:
             code = "azure_rate_limit"
         else:
             raw_msg = str(getattr(exc, "message", "") or str(exc) or "").strip()
-            message = f"The Azure Foundry request failed: {raw_msg}" if raw_msg else "The Azure Foundry request failed."
-            code = "azure_upstream_error"
+            if "SubscriptionNotRegistered" in raw_msg or "ReadOnlyDisabledSubscription" in raw_msg:
+                message = (
+                    "Your Azure subscription is currently Disabled or has reached its spending limit. "
+                    "To fix this, go to the Azure Portal (https://portal.azure.com) -> Subscriptions -> "
+                    "select your subscription, and click 'Remove spending limit' or 'Reactivate subscription'."
+                )
+                code = "azure_subscription_disabled"
+            else:
+                message = f"The Azure Foundry request failed: {raw_msg}" if raw_msg else "The Azure Foundry request failed."
+                code = "azure_upstream_error"
         return ProviderError(
             message,
             status_code=status,
             error_type="api_error",
             code=code,
         )
+
